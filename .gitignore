@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 runs/
 checkpoints/
+.ipynb_checkpoints/
