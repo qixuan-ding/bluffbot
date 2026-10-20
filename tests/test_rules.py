@@ -11,7 +11,7 @@ from bluffbot.env import HeadsUpEnv
 FOLD = 0
 CHECK_CALL = 1
 MIN_RAISE = 2
-ALL_IN = 3
+ALL_IN = 5
 
 
 @pytest.fixture(params=[1, 0], ids=["button", "big_blind"])

@@ -1,6 +1,8 @@
 import gymnasium as gym
-import numpy as np
 from pokerkit import Automation, Deck, NoLimitTexasHoldem
+
+from .actions import Action, NUM_ACTIONS, action_options
+from .observations import encode_observation, observation_space
 
 
 class HeadsUpEnv(gym.Env):
@@ -16,20 +18,12 @@ class HeadsUpEnv(gym.Env):
 
     def __init__(self):
         # Calls initialization from the HeadsUp Env
-        # Enumeraters actions and creates observation space which is a 15 number array
+        # Enumeraters actions and creates observation space, actions.py and observations.py
         super().__init__()
 
-        # 0~3: fold, check/call, min bet/raise, all-in respectively
-        self.action_space = gym.spaces.Discrete(4)
+        self.action_space = gym.spaces.Discrete(NUM_ACTIONS)
 
-        # Own cards (2), Board cards (5), Stacks (2), Current bets (2)
-        # Street, pot, call amount, button flag: 4
-        self.observation_space = gym.spaces.Box(
-            low=0.0,
-            high=200.0,
-            shape=(15,),
-            dtype=np.float32,
-        )
+        self.observation_space = observation_space()
 
         self.state = None
         self.hand_count = 0
@@ -90,39 +84,15 @@ class HeadsUpEnv(gym.Env):
         return self._observation(), self._info()
 
     def action_masks(self):
-        # Determines which actions are currently legal, initialized as all false
-
-        mask = np.zeros(4, dtype=bool)
-
-        if self.state is None or not self.state.status:
-            return mask
-
-        if self.state.actor_index != self.learner_index:
-            return mask
-
-        state = self.state
-
-        mask[0] = state.can_fold()
-        mask[1] = state.can_check_or_call()
-        mask[2] = state.can_complete_bet_or_raise_to()
-
-        all_in_to = (
-            state.bets[self.learner_index]
-            + state.stacks[self.learner_index]
-        )
-
-        mask[3] = state.can_complete_bet_or_raise_to(
-            all_in_to
-        )
-
+        # Determines which actions are currently legal
+        mask, _ = action_options(self.state, self.learner_index)
         return mask
 
     def step(self, action):
-        # The agent executes an action
-        # Returns the observation (array of size 15),
-        # reward function (0 until the end),
-        # if program terminated, if program truncated (false after successful step),
-        # info, which contains inspection and logging
+        # The agent executes an action, then returns an observation
+        # RETURNS: reward function (0 until the end),
+        #          if program terminated, if program truncated (false after successful step),
+        #          info, which contains inspection and logging
 
         if self.state is None or not self.state.status:
             raise RuntimeError(
@@ -133,26 +103,24 @@ class HeadsUpEnv(gym.Env):
             raise ValueError(f"Unknown action: {action}")
 
         action = int(action)
+        mask, amounts = action_options(self.state, self.learner_index)
 
-        if not self.action_masks()[action]:
-            raise ValueError(f"Illegal action: {action}")
+        if not mask[action]:
+            raise ValueError(f"Illegal or duplicate action: {action}")
 
-        if action == 0:
+        if action == Action.FOLD:
             self.state.fold()
 
-        elif action == 1:
+        elif action == Action.CHECK_CALL:
             self.state.check_or_call()
 
-        elif action == 2:
+        elif action == Action.MIN_RAISE:
             # No amount means the minimum legal bet/raise.
-            self.state.complete_bet_or_raise_to()
+            # The shared action mapping now supplies that minimum explicitly.
+            self.state.complete_bet_or_raise_to(amounts[action])
 
         else:
-            i = self.learner_index
-
-            self.state.complete_bet_or_raise_to(
-                self.state.bets[i] + self.state.stacks[i]
-            )
+            self.state.complete_bet_or_raise_to(amounts[action])
 
         self.decisions += 1
         self._advance()
@@ -209,62 +177,20 @@ class HeadsUpEnv(gym.Env):
                 )
 
     def _observation(self):
-        # Convert gamestate data into the 15-number array fed into the agent
 
-        state = self.state
-        i = self.learner_index
-        other = 1 - i
-
-        def encode(cards, length):
-            values = [
-                self.CARD_IDS[card] / 52.0
-                for card in cards
-            ]
-            return (values + [0.0] * length)[:length]
-
-        own_cards = encode(state.hole_cards[i], 2)
-
-        board_cards = encode(
-            [
-                card
-                for group in state.board_cards
-                for card in group
-            ],
-            5,
-        )
-
-        call_amount = 0
-
-        if state.status and state.actor_index == i:
-            call_amount = (
-                state.checking_or_calling_amount or 0
-            )
-
-        return np.array(
-            own_cards
-            + board_cards
-            + [
-                state.stacks[i] / 2,
-                state.stacks[other] / 2,
-                state.bets[i] / 2,
-                state.bets[other] / 2,
-                (
-                    state.street_index
-                    if state.street_index is not None
-                    else 0
-                ) / 3,
-                state.total_pot_amount / 2,
-                call_amount / 2,
-                float(i == 1),
-            ],
-            dtype=np.float32,
+        return encode_observation(
+            self.state, self.learner_index, self.BIG_BLIND
         )
 
     def _info(self):
+        # Misc training info
+
+        _, amounts = action_options(self.state, self.learner_index)
         info = {
             "learner_index": self.learner_index,
             "learner_is_button": self.learner_index == 1,
             "learner_decisions": self.decisions,
+            "action_raise_to": amounts,
         }
 
         if not self.state.status:
