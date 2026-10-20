@@ -119,6 +119,10 @@ class HeadsUpEnv(gym.Env):
 
     def step(self, action):
         # The agent executes an action
+        # Returns the observation (array of size 15),
+        # reward function (0 until the end),
+        # if program terminated, if program truncated (false after successful step),
+        # info, which contains inspection and logging
 
         if self.state is None or not self.state.status:
             raise RuntimeError(
