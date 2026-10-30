@@ -1,24 +1,16 @@
-"""Regression tests for the current heads-up, check/call-opponent wrapper."""
+"""Environment integration, action execution, and poker settlement regressions."""
 
 import numpy as np
 import pytest
 from pokerkit import (
-    Automation,
     Card,
     CheckingOrCalling,
     CompletionBettingOrRaisingTo,
     Deck,
-    NoLimitTexasHoldem,
 )
 
-from bluffbot.actions import Action, action_options
+from bluffbot.actions import Action
 from bluffbot.env import HeadsUpEnv
-from bluffbot.observations import (
-    CARD_INDEX,
-    HISTORY_LENGTH,
-    encode_observation,
-    observation_space,
-)
 
 
 # Current action IDs. Update these when the six-action menu is introduced.
@@ -26,19 +18,6 @@ FOLD = 0
 CHECK_CALL = 1
 MIN_RAISE = 2
 ALL_IN = 5
-
-
-@pytest.fixture(params=[1, 0], ids=["button", "big_blind"])
-def env(request):
-    environment = HeadsUpEnv()
-    environment.reset(seed=42)
-
-    # Seed once: passing a seed again also resets the position rotation.
-    if request.param == 0:
-        environment.reset()
-
-    yield environment
-    environment.close()
 
 
 def assert_chips_conserved(env):
@@ -257,13 +236,6 @@ def test_one_thousand_random_legal_hands():
 # These checks cover the six-action menu and public observation contract.
 
 
-def make_betting_state(stacks=(200, 200)):
-    """Create a PokerKit hand paused at the first betting decision."""
-    return NoLimitTexasHoldem.create_state(
-        tuple(Automation), False, 0, (1, 2), 2, stacks, len(stacks)
-    )
-
-
 class FixedDeckEnv(HeadsUpEnv):
     """Use known cards so payout tests do not depend on random outcomes."""
 
@@ -281,97 +253,6 @@ class FixedDeckEnv(HeadsUpEnv):
             self.state.deck_cards.extend(self.card_order + remaining)
 
         super()._advance()
-
-
-@pytest.mark.parametrize(
-    "small_blind_stack, expected",
-    [
-        (200, (None, None, 4, None, 6, 200)),
-        (5, (None, None, 4, None, 5, None)),
-        (3, (None, None, 3, None, None, None)),
-    ],
-)
-def test_raise_candidates_clip_to_stack_and_remove_duplicates(
-    small_blind_stack, expected
-):
-    state = make_betting_state((200, small_blind_stack))
-    mask, amounts = action_options(state, 1)
-
-    assert amounts == expected
-    assert mask.dtype == np.bool_
-    assert mask[:2].tolist() == [True, True]
-
-    raises = [amount for amount in amounts if amount is not None]
-    assert len(raises) == len(set(raises))
-    assert mask[2:].tolist() == [amount is not None for amount in amounts[2:]]
-
-
-def test_raise_sizes_use_pot_after_calling():
-    state = make_betting_state()
-    state.complete_bet_or_raise_to(10)
-
-    # BB has bet 2, must call 8, and the current pot is 12.
-    # The half-pot raise-to is 2 + 8 + (12 + 8) / 2 = 20.
-    mask, amounts = action_options(state, 0)
-
-    assert state.actor_index == 0
-    assert state.total_pot_amount == 12
-    assert state.checking_or_calling_amount == 8
-    assert mask.all()
-    assert amounts == (None, None, 18, 20, 30, 200)
-
-
-def test_half_pot_rounds_an_odd_chip_upward():
-    state = make_betting_state((200, 200, 200))
-    state.check_or_call()
-    state.fold()
-    state.check_or_call()
-
-    # The folded small blind leaves a 5-chip pot on the flop.
-    mask, amounts = action_options(state, state.actor_index)
-
-    assert state.total_pot_amount == 5
-    assert mask[Action.HALF_POT]
-    assert amounts[Action.MIN_RAISE] == 2
-    assert amounts[Action.HALF_POT] == 3
-
-
-def test_all_in_call_is_available_only_as_check_call():
-    state = make_betting_state((6, 200))
-    state.complete_bet_or_raise_to(10)
-
-    mask, amounts = action_options(state, 0)
-
-    assert state.checking_or_calling_amount == 4
-    assert mask.tolist() == [True, True, False, False, False, False]
-    assert amounts == (None,) * 6
-
-
-def test_short_all_in_does_not_reopen_raising():
-    state = make_betting_state((12, 200, 200))
-    state.complete_bet_or_raise_to(10)
-    state.complete_bet_or_raise_to(12)
-    state.check_or_call()
-
-    # Player 2 already raised; the extra 2 is less than a full raise of 8.
-    assert state.actor_index == 2
-    mask, amounts = action_options(state, 2)
-
-    assert mask.tolist() == [True, True, False, False, False, False]
-    assert amounts == (None,) * 6
-
-
-def test_full_raise_reopens_raising():
-    state = make_betting_state((200, 200, 200))
-    state.complete_bet_or_raise_to(10)
-    state.complete_bet_or_raise_to(18)
-    state.check_or_call()
-
-    assert state.actor_index == 2
-    mask, amounts = action_options(state, 2)
-
-    assert mask[Action.MIN_RAISE]
-    assert amounts[Action.MIN_RAISE] == 26
 
 
 def test_duplicate_action_is_rejected_without_changing_hand(env):
@@ -415,7 +296,7 @@ def test_environment_executes_each_mapped_raise(env, action, expected_raise_to):
 
 
 @pytest.mark.parametrize("raise_to", [10, 200])
-def test_folding_to_opponent_raise_returns_unmatched_chips(raise_to):
+def test_folding_to_opponent_raise_returns_unmatched_chips(raise_to, make_betting_state):
     state = make_betting_state()
     state.complete_bet_or_raise_to(raise_to)
 
@@ -485,102 +366,4 @@ def test_royal_flush_on_board_splits_pot(learner_index, action):
     assert_settled(environment, result)
     assert result[4]["final_stacks"] == (200, 200)
     assert result[1] == 0.0
-    environment.close()
-
-
-def test_observation_reserves_nine_learner_relative_seats(env):
-    observation = env._observation()
-
-    assert env.observation_space.contains(observation)
-    assert observation["own_cards"].shape == (52,)
-    assert observation["board_cards"].shape == (52,)
-    assert observation["seats"].shape == (9, 9)
-    assert observation["seat_mask"].tolist() == [1, 1, 0, 0, 0, 0, 0, 0, 0]
-    assert not observation["seats"][2:].any()
-
-    # Slot 0 is the learner, even when the engine seat index changes.
-    assert observation["seats"][0, 0] == env.state.stacks[env.learner_index] / 2
-    assert observation["seats"][0, 6] == float(env.learner_index == 1)
-    assert observation["seats"][1, 6] == float(env.learner_index == 0)
-    assert observation["seats"][:2, 3].tolist() == [1, 1]
-    assert not observation["seats"][:2, 4:6].any()
-    np.testing.assert_array_equal(observation["legal_actions"], env.action_masks())
-
-
-def test_observation_separates_street_bets_from_total_contributions(env):
-    observation, reward, done, _, _ = env.step(Action.POT)
-
-    assert not done
-    assert reward == 0
-    assert observation["board_cards"].sum() == 3
-    np.testing.assert_allclose(observation["seats"][:2, 0], [97, 97])
-    np.testing.assert_array_equal(observation["seats"][:2, 1], [0, 0])
-    np.testing.assert_array_equal(observation["seats"][:2, 2], [3, 3])
-    assert observation["table"][1] == 6
-
-
-def test_hidden_cards_and_future_deck_do_not_change_observation(env):
-    before = env._observation()
-    opponent = 1 - env.learner_index
-
-    old_cards = list(env.state.hole_cards[opponent])
-    new_cards = [env.state.deck_cards.popleft() for _ in range(2)]
-    env.state.hole_cards[opponent][:] = new_cards
-    env.state.deck_cards.extend(old_cards)
-    env.state.deck_cards.reverse()
-
-    after = env._observation()
-
-    for field in before:
-        np.testing.assert_array_equal(before[field], after[field])
-
-    expected_own_cards = np.zeros(52, dtype=np.float32)
-    for card in env.state.hole_cards[env.learner_index]:
-        expected_own_cards[CARD_INDEX[card]] = 1
-    np.testing.assert_array_equal(after["own_cards"], expected_own_cards)
-
-
-def test_public_history_preserves_raise_total_and_chips_added(env):
-    starting_bet = env.state.bets[env.learner_index]
-    observation, _, _, _, _ = env.step(Action.POT)
-
-    # History columns: present, actor[9], street[4], kind[5], added, raise-to.
-    history = observation["history"]
-    raise_rows = history[history[:, 18] == 1]
-    assert len(raise_rows) == 1
-
-    row = raise_rows[0]
-    assert row[0] == 1
-    assert row[1] == 1
-    assert row[10] == 1
-    assert row[-2] == (6 - starting_bet) / 2
-    assert row[-1] == 3
-
-
-def test_public_history_keeps_only_latest_sixteen_actions():
-    state = make_betting_state()
-
-    for _ in range(20):
-        state.complete_bet_or_raise_to()
-
-    observation = encode_observation(state, state.actor_index, 2)
-    history = observation["history"]
-
-    assert observation_space().contains(observation)
-    assert history.shape == (HISTORY_LENGTH, 21)
-    assert history[:, 0].sum() == HISTORY_LENGTH == 16
-    assert history[:, 18].tolist() == [1] * 16
-    assert history[-1, -1] == 21
-
-
-def test_folded_seat_is_distinct_from_unused_seat():
-    environment = HeadsUpEnv()
-    environment.reset(seed=42)
-    observation, _, _, _, _ = environment.step(Action.FOLD)
-
-    assert observation["seat_mask"][0] == 1
-    assert observation["seats"][0, 3] == 0
-    assert observation["seats"][0, 4] == 1
-    assert observation["seat_mask"][2] == 0
-    assert not observation["seats"][2].any()
     environment.close()
