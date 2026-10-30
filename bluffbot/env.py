@@ -1,12 +1,19 @@
 import gymnasium as gym
+import numpy as np
 from pokerkit import Automation, Deck, NoLimitTexasHoldem
 
 from .actions import Action, NUM_ACTIONS, action_options
 from .observations import encode_observation, observation_space
+from .opponents import OPPONENT_NAMES, make_opponent
 
 
 class HeadsUpEnv(gym.Env):
-    """Step 6 scaffold: one heads-up hand per episode."""
+    """One heads-up hand per episode against a fixed or sampled scripted bot.
+
+    If the opponent folds before the learner acts, reset exposes a forced
+    CHECK_CALL acknowledgement. Its step returns the terminal reward without
+    executing a poker action; info['learner_acted'] is False for that step.
+    """
 
     STARTING_STACK = 200
     BIG_BLIND = 2
@@ -16,7 +23,7 @@ class HeadsUpEnv(gym.Env):
         for i, card in enumerate(Deck.STANDARD)
     }
 
-    def __init__(self):
+    def __init__(self, opponent="check_call"):
         # Calls initialization from the HeadsUp Env
         # Enumeraters actions and creates observation space, actions.py and observations.py
         super().__init__()
@@ -29,10 +36,33 @@ class HeadsUpEnv(gym.Env):
         self.hand_count = 0
         self.learner_index = 1
         self.decisions = 0
+        self._opponent_pool = (
+            tuple(make_opponent(name) for name in OPPONENT_NAMES)
+            if isinstance(opponent, str) and opponent == "mixture"
+            else (make_opponent(opponent) if isinstance(opponent, str) else opponent,)
+        )
+        if not all(
+            callable(getattr(bot, "choose_action", None))
+            for bot in self._opponent_pool
+        ):
+            raise TypeError("An opponent must provide choose_action(observation, mask, rng).")
+        self.opponent = self._opponent_pool[0]
+        self._opponent_rng = None
+        self._pending_terminal = False
 
     def reset(self, *, seed=None, options=None):
         # Starts a fresh hand and stops at the first decision
         super().reset(seed=seed)
+
+        # Keep opponent draws separate so action choices do not change future decks.
+        if seed is not None or self._opponent_rng is None:
+            self._opponent_rng = np.random.default_rng(
+                np.random.SeedSequence([self.np_random_seed, 1])
+            )
+        self.opponent = self._opponent_pool[
+            int(self._opponent_rng.integers(len(self._opponent_pool)))
+        ]
+        self._pending_terminal = False
 
         if seed is not None:
             self.hand_count = 0
@@ -76,16 +106,18 @@ class HeadsUpEnv(gym.Env):
 
         self._advance()
 
-        if not self.state.status:
-            raise RuntimeError(
-                "Hand ended before the learner could act."
-            )
+        # Gym reset cannot return a terminal reward. Expose one forced
+        # acknowledgement transition for a hand won before any learner action.
+        # It settles the episode without executing or counting a poker decision.
+        self._pending_terminal = not self.state.status
 
         return self._observation(), self._info()
 
     def action_masks(self):
         # Determines which actions are currently legal
         mask, _ = action_options(self.state, self.learner_index)
+        if self._pending_terminal:
+            mask[Action.CHECK_CALL] = True
         return mask
 
     def step(self, action):
@@ -94,7 +126,7 @@ class HeadsUpEnv(gym.Env):
         #          if program terminated, if program truncated (false after successful step),
         #          info, which contains inspection and logging
 
-        if self.state is None or not self.state.status:
+        if self.state is None or (not self.state.status and not self._pending_terminal):
             raise RuntimeError(
                 "Call reset() before starting a new hand."
             )
@@ -103,10 +135,15 @@ class HeadsUpEnv(gym.Env):
             raise ValueError(f"Unknown action: {action}")
 
         action = int(action)
-        mask, amounts = action_options(self.state, self.learner_index)
+        mask = self.action_masks()
+        _, amounts = action_options(self.state, self.learner_index)
 
         if not mask[action]:
             raise ValueError(f"Illegal or duplicate action: {action}")
+
+        if self._pending_terminal:
+            self._pending_terminal = False
+            return self._step_result(learner_acted=False)
 
         if action == Action.FOLD:
             self.state.fold()
@@ -125,6 +162,10 @@ class HeadsUpEnv(gym.Env):
         self.decisions += 1
         self._advance()
 
+        return self._step_result(learner_acted=True)
+
+    def _step_result(self, learner_acted):
+
         terminated = not self.state.status
         reward = 0.0
 
@@ -141,12 +182,14 @@ class HeadsUpEnv(gym.Env):
                 - self.STARTING_STACK
             ) / self.BIG_BLIND
 
+        info = self._info()
+        info["learner_acted"] = learner_acted
         return (
             self._observation(),
             reward,
             terminated,
             False,  # No time-limit truncation.
-            self._info(),
+            info,
         )
 
     def _advance(self):
@@ -169,7 +212,24 @@ class HeadsUpEnv(gym.Env):
 
             elif state.actor_index is not None:
                 # Temporary opponent: always check or call.
-                state.check_or_call()
+                # The default still checks/calls; configured bots use the same menu.
+                actor = state.actor_index
+                mask, amounts = action_options(state, actor)
+                observation = encode_observation(state, actor, self.BIG_BLIND)
+                action = self.opponent.choose_action(
+                    observation, mask.copy(), self._opponent_rng
+                )
+                if not self.action_space.contains(action) or not mask[int(action)]:
+                    raise ValueError(
+                        f"Opponent selected an illegal or duplicate action: {action}"
+                    )
+                action = int(action)
+                if action == Action.FOLD:
+                    state.fold()
+                elif action == Action.CHECK_CALL:
+                    state.check_or_call()
+                else:
+                    state.complete_bet_or_raise_to(amounts[action])
 
             else:
                 raise RuntimeError(
@@ -178,9 +238,11 @@ class HeadsUpEnv(gym.Env):
 
     def _observation(self):
 
-        return encode_observation(
+        observation = encode_observation(
             self.state, self.learner_index, self.BIG_BLIND
         )
+        observation["legal_actions"][:] = self.action_masks()
+        return observation
 
     def _info(self):
         # Misc training info
@@ -191,6 +253,8 @@ class HeadsUpEnv(gym.Env):
             "learner_is_button": self.learner_index == 1,
             "learner_decisions": self.decisions,
             "action_raise_to": amounts,
+            "opponent": getattr(self.opponent, "name", type(self.opponent).__name__),
+            "awaiting_terminal_acknowledgement": self._pending_terminal,
         }
 
         if not self.state.status:
